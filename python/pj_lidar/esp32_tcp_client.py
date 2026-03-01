@@ -142,6 +142,10 @@ class Esp32TcpClient(Node):
         self.udp_thread = None
         self._udp_thread_stop = False
         
+        self.last_left_speed = None
+        self.last_right_speed = None
+        self.last_disabled = False
+
         # Подписчик на команды скорости от ROS2 навигации
         # Подписчики: ручные и автокоманды отдельно
         self.cmd_vel_sub = self.create_subscription(
@@ -551,19 +555,29 @@ class Esp32TcpClient(Node):
 
         self.get_logger().info(f'⬅️ Левый мотор: {speed_left}, ➡️ Правый мотор: {speed_right}')
 
-        # Отправить обе команды
-        self.send_command(f'set_motor_left:{speed_left}')
-        self.send_command(f'set_motor_right:{speed_right}')
+        # Отправляем команды только при изменении скорости
+        if speed_left != self.last_left_speed:
+            self.send_command(f'set_motor_left:{speed_left}')
+            self.last_left_speed = speed_left
+        if speed_right != self.last_right_speed:
+            self.send_command(f'set_motor_right:{speed_right}')
+            self.last_right_speed = speed_right
 
-        # Обновить время последней ненулевой команды
+        # Обновить время последней ненулевой команды и сбросить флаг disable
         if left != 0 or right != 0:
             self.last_nonzero_time = time.time()
+            if self.last_disabled:
+                self.last_disabled = False
 
-        # Если оба мотора на нуле - отправлять disable только если прошло немного времени
+        # Если оба мотора на нуле - отправлять disable только при переходе
         if left == 0 and right == 0:
             if not self.auto_mode_active and time.time() - self.last_nonzero_time > 0.15:
-                self.get_logger().info('🛑 Моторы остановлены (disable)')
-                self.send_command('disable_motors')
+                if not self.last_disabled:
+                    self.get_logger().info('🛑 Моторы остановлены (disable)')
+                    self.send_command('disable_motors')
+                    self.last_disabled = True
+        else:
+            self.last_disabled = False
 
         # Если автопилот больше не посылал команды длительное время — снять флаг
         if time.time() - self.last_auto_time > 1.0:

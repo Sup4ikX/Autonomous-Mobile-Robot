@@ -1,0 +1,52 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+    
+    - name: Install dependencies
+      run: |
+        pip install --upgrade pip
+        pip install pylint flake8 pytest pyyaml
+    
+    - name: Python lint (flake8)
+      run: |
+        flake8 python/pj_lidar --max-line-length=120 --ignore=E501,W503
+    
+    - name: Python lint (pylint)
+      run: |
+        pylint python/pj_lidar --disable=C0111,R0903 --max-line-length=120 || true
+    
+    - name: Run pytest
+      run: |
+        pytest python/tests/ -v --tb=short
+    
+    - name: Set up ROS2
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y ros-humble-desktop
+        source /opt/ros/humble/setup.bash
+    
+    - name: Build with colcon
+      run: |
+        source /opt/ros/humble/setup.bash
+        colcon build --symlink-install
+    
+    - name: Upload coverage
+      uses: codecov/codecov-action@v3
+      with:
+        files: ./coverage.xml

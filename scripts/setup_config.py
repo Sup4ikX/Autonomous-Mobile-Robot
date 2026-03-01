@@ -1,0 +1,1 @@
+/home/abodik345/Desktop/VSC/python/pj_lidar/setup_config.py

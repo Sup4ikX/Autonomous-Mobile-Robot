@@ -1,0 +1,78 @@
+version: '3.8'
+
+services:
+  pj_lidar:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: pj_lidar_container
+    restart: unless-stopped
+    environment:
+      - ROS_DOMAIN_ID=0
+      - ROS_LOCALHOST_ONLY=0
+      - DISPLAY=${DISPLAY:-}
+    volumes:
+      # Mount maps directory for persistent storage
+      - ./maps:/opt/ros_ws/maps
+      # Mount X11 socket for GUI (Linux)
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      # Mount Docker socket for potential Docker-in-Docker usage
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    ports:
+      # ESP32 TCP control port
+      - "3333:3333"
+      # LiDAR UDP data port
+      - "8888:8888"
+      # SLAM Toolbox web interface (if enabled)
+      - "1491:1491"
+    devices:
+      # Mount serial devices for direct hardware access (if needed)
+      - /dev/ttyUSB0:/dev/ttyUSB0
+      - /dev/ttyACM0:/dev/ttyACM0
+    privileged: true
+    networks:
+      - pj_lidar_network
+
+  # Optional: Web interface service for remote monitoring
+  web_monitor:
+    image: nginx:alpine
+    container_name: pj_lidar_web
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    volumes:
+      - ./web_interface:/usr/share/nginx/html:ro
+      - ./maps:/usr/share/nginx/html/maps:ro
+    depends_on:
+      - pj_lidar
+    networks:
+      - pj_lidar_network
+
+  # Optional: Data backup service
+  backup:
+    image: alpine:latest
+    container_name: pj_lidar_backup
+    restart: "no"
+    volumes:
+      - ./maps:/backup/source:ro
+      - ./backups:/backup/destination
+    command: >
+      sh -c "
+        apk add --no-cache tar gzip &&
+        tar -czf /backup/destination/backup_$(date +%Y%m%d_%H%M%S).tar.gz -C /backup/source .
+      "
+    networks:
+      - pj_lidar_network
+
+networks:
+  pj_lidar_network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+volumes:
+  maps:
+    driver: local
+  backups:
+    driver: local

@@ -1,0 +1,10 @@
+[console_scripts]
+esp32_tcp_client = pj_lidar.esp32_tcp_client:main
+lidar_udp_server = pj_lidar.lidar_udp_server_new:main
+robot_controller = pj_lidar.robot_controller:main
+robot_monitor = pj_lidar.robot_monitor:main
+scan_state_machine = pj_lidar.scan_state_machine:main
+setup_config = pj_lidar.setup_config:main
+slam_monitor = pj_lidar.slam_monitor:main
+start_scan = pj_lidar.start_scan:main
+static_tf_broadcaster = pj_lidar.static_tf_broadcaster:main

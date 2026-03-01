@@ -1,0 +1,233 @@
+# ESP32 LiDAR Robot Mapper - Git Ignore
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# ROS2
+**/build/
+**/install/
+**/log/
+**/*.so
+**/*.so.*
+**/*.a
+**/*.o
+**/*.pyc
+**/__pycache__/
+
+# Docker
+.dockerignore
+docker-compose.override.yml
+.docker/
+*.tgz
+*.tar.gz
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Logs
+*.log
+*.log.*
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Runtime data
+pids
+*.pid
+*.seed
+*.pid.lock
+
+# Coverage directory used by tools like istanbul
+coverage/
+
+# nyc test coverage
+.nyc_output
+
+# Grunt intermediate storage
+.grunt
+
+# Bower dependency directory
+bower_components
+
+# node-waf configuration
+.lock-wscript
+
+# Compiled binary addons
+build/Release
+
+# Dependency directories
+node_modules/
+jspm_packages/
+
+# TypeScript v1 declaration files
+typings/
+
+# Optional npm cache directory
+.npm
+
+# Optional eslint cache
+.eslintcache
+
+# Optional REPL history
+.node_repl_history
+
+# Output of 'npm pack'
+*.tgz
+
+# Yarn Integrity file
+.yarn-integrity
+
+# dotenv environment variables file
+.env
+
+# next.js build output
+.next
+
+# nuxt.js build output
+.nuxt
+
+# vuepress build output
+.vuepress/dist
+
+# Serverless directories
+.serverless
+
+# FuseBox cache
+.fusebox/
+
+# DynamoDB Local files
+.dynamodb/
+
+# TernJS port file
+.tern-port
+
+# Stores VSCode versions used for testing VSCode extensions
+.vscode-test
+
+# ESP32 specific
+*.bin
+*.elf
+*.hex
+*.map
+*.d
+*.lst
+*.sym
+*.partitions.bin
+
+# Arduino IDE
+*.ino.build/
+*.pde.build/
+*.hex
+*.elf
+*.map
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.backup
+
+# Maps and data
+maps/
+*.pgm
+*.yaml
+*.png
+*.jpg
+*.jpeg
+*.bmp
+
+# Configuration backups
+*.bak
+*.backup
+*.orig
+
+# Test results
+test-results/
+*.xml
+*.html
+
+# Documentation build
+docs/_build/
+docs/build/
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# Backup files
+*.rar
+*.zip
+*.7z
+*.tar
+*.gz
+
+# System files
+*.tmp
+*.swp
+*.swo
+*~
+
+# Windows
+[Dd]esktop.ini
+$RECYCLE.BIN/
+*.cab
+*.msi
+*.msix
+*.msm
+*.msp
+*.lnk
+
+# macOS
+*.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+
+# Linux
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+.nfs*

@@ -1,0 +1,13 @@
+Metadata-Version: 2.4
+Name: pj_lidar
+Version: 1.0.0
+Summary: ESP32 LiDAR Robot Mapper - Full-featured autonomous room mapping system
+Maintainer: sup4ikX
+Maintainer-email: sup4ikX@example.com
+License: AGPL-3.0
+Requires-Dist: setuptools
+Dynamic: license
+Dynamic: maintainer
+Dynamic: maintainer-email
+Dynamic: requires-dist
+Dynamic: summary

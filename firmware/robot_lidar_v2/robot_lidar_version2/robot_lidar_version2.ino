@@ -13,6 +13,7 @@
   #include "lwip/netdb.h"
   #include <fcntl.h>
   #include <cstdint>
+  #include <errno.h>
 //#include "include/lidar_data_new.h"
   #include "include/udp_handler_new.h"
   #include "include/display_handler.h"
@@ -33,8 +34,12 @@
 #define PIN_BATTERY     34
 
 #define PWM_FREQ        2000
-#define PWM_RESOLUTION  8
-
+#define PWM_RESOLUTION  8           // 8-bit for drive motors
+#define LIDAR_PWM_RESOLUTION 8      // 8-bit for lidar motor (16-bit was not working)
+#define LIDAR_START_PWM 145         // Initial 8-bit PWM to start lidar rotation (within 135-155 range)
+#define LIDAR_PWM_MIN 135            // Minimum PWM when lidar is enabled
+#define LIDAR_PWM_MAX 155            // Maximum PWM when lidar is enabled
+#define LIDAR_PID_INTERVAL 1000       // PID update interval in ms
 
 // ===== STRUCTURES =====
 struct Settings {
@@ -55,9 +60,21 @@ int udpPort = 4444;
 volatile int32_t hall_left_counter = 0;
 volatile int32_t hall_right_counter = 0;
 
-int lidarCurrentDuty = 0;
+int lidarCurrentDuty = 0;               // not used directly anymore, kept for compatibility
 float current_battery_voltage = 0.0;
-unsigned long last_broadcast = 0;
+unsigned long last_telemetry = 0;
+unsigned long last_status = 0;
+
+// Lidar PID control
+bool lidar_enabled = false;               // Lidar motor state
+float lidar_target_speed = 6.5;            // Desired speed in rps (user adjustable)
+float lidar_motor_speed = 0.0;             // Measured speed from packets (last known)
+// PID coefficients (tune as needed)
+float lidar_Kp = 150, lidar_Ki = 0.5, lidar_Kd = 0.1;
+float lidar_integral = 0.0;
+float lidar_prev_error = 0.0;
+unsigned long lidar_last_pid_time = 0;
+float lidar_current_pwm = 0.0;             // Current PWM output from PID (0-255)
 
 int server_socket = -1;
 int client_socket = -1;
@@ -124,13 +141,13 @@ public:
       digitalWrite(pin_cw, HIGH);
       digitalWrite(pin_ccw, LOW);
       ledcWrite(pin_pwm_cw, 0);
-      ledcWrite(pin_pwm_ccw, m_speed);
+      ledcWrite(pin_pwm_ccw, m_speed);   // 8-bit value
       Serial.printf("[MOTOR:%s] REVERSE PWM=%d\n", motor_name, m_speed);
     } else if (value > 0) {
       digitalWrite(pin_ccw, HIGH);
       digitalWrite(pin_cw, LOW);
       ledcWrite(pin_pwm_ccw, 0);
-      ledcWrite(pin_pwm_cw, m_speed);
+      ledcWrite(pin_pwm_cw, m_speed);     // 8-bit value
       Serial.printf("[MOTOR:%s] FORWARD PWM=%d\n", motor_name, m_speed);
     } else {
       digitalWrite(pin_ccw, HIGH);
@@ -147,7 +164,6 @@ public:
 
 Motor leftMotor(PIN_Lm_pwm_CCW, PIN_Lm_pwm_CW, PIN_Lm_CCW, PIN_Lm_CW, "LEFT");
 Motor rightMotor(PIN_Rm_pwm_CCW, PIN_Rm_pwm_CW, PIN_Rm_CCW, PIN_Rm_CW, "RIGHT");
-
 
 volatile uint32_t lastEventHallLeft = 0;
 volatile uint32_t lastEventHallRight = 0;
@@ -176,7 +192,6 @@ void IRAM_ATTR hallLeftISR() {
   }
 }
 
-
 void IRAM_ATTR hallRightISR() {
   if (digitalRead(PIN_HALL_RIGHT) == 0) {
     uint32_t now = micros();
@@ -192,7 +207,6 @@ void IRAM_ATTR hallRightISR() {
     }
   }
 }
-
 
 // ===== TELEMETRY =====
 void sendTelemetryUDP() {
@@ -258,7 +272,7 @@ void initTcpServer() {
   addr.sin_family = AF_INET;
   addr.sin_addr.s_addr = INADDR_ANY;
   addr.sin_port = htons(tcpPort);
-  if (bind(server_socket, (struct sockaddr *)&addr, sizeof(addr)) < 0 || listen(server_socket, 1) < 0) {
+  if (bind(server_socket, (struct sockaddr *)&addr, sizeof(addr)) < 0 || listen(server_socket, 4) < 0) {
     Serial.println("[TCP] Bind/Listen error");
     close(server_socket);
     server_socket = -1;
@@ -275,8 +289,14 @@ void processTcpServer() {
     if (ns >= 0) {
       client_socket = ns;
       client_connected = true;
-      Serial.println("[TCP] Client connected");
+      Serial.printf("[TCP] New client connected from %s:%d\n",
+                    inet_ntoa(caddr.sin_addr), ntohs(caddr.sin_port));
       DisplayHandler::addLogTCP("Client connected");
+    } else {
+      int err = errno;
+      if (err != EAGAIN && err != EWOULDBLOCK) {
+        Serial.printf("[TCP] accept error: %d\n", err);
+      }
     }
   }
   if (client_socket >= 0 && client_connected) {
@@ -349,17 +369,26 @@ void handleTcpCommand(const String &command) {
     leftMotorSpeed = 0; rightMotorSpeed = 0;
     leftMotor.setSpeed(0); rightMotor.setSpeed(0);
     DisplayHandler::addLogSuccess("Motors disabled");
-  } else if (cmdLower.startsWith("set_lidar_pwm:")) {
-    int pwm = cmd.substring(cmd.indexOf(':') + 1).toInt();
-    if (pwm >= 0 && pwm <= 255) {
-      lidarCurrentDuty = pwm;
-      ledcWrite(PIN_LidarM_pwm, pwm);
-      DisplayHandler::addLogInfo("Lidar PWM: " + String(pwm));
-    } else {
-      DisplayHandler::addLogWarning("Invalid lidar PWM: " + String(pwm));
-    }
+  } else if (cmdLower == "lidar_on") {
+    lidar_enabled = true;
+    lidar_last_pid_time = millis();
+    lidar_integral = 0.0;
+    lidar_prev_error = 0.0;
+    ledcWrite(PIN_LidarM_pwm, LIDAR_START_PWM);  // initial 8-bit PWM to start rotation
+    DisplayHandler::addLogInfo("Lidar enabled, target " + String(lidar_target_speed, 1) + " rps, initial PWM set to " + String(LIDAR_START_PWM));
+  } else if (cmdLower == "lidar_off") {
+    lidar_enabled = false;
+    ledcWrite(PIN_LidarM_pwm, 0);
+    lidar_motor_speed = 0.0;
+    lidar_current_pwm = 0.0;
+    DisplayHandler::addLogInfo("Lidar disabled");
   } else if (cmdLower == "status") {
-    String resp = String("STATUS:L=") + String(getLeftCounter()) + ",R=" + String(getRightCounter()) + ",BAT=" + String((analogRead(PIN_BATTERY) / 4095.0) * 3.3 * 2, 2) + "V\n";
+    String resp = String("STATUS:L=") + String(getLeftCounter()) + ",R=" + String(getRightCounter()) +
+      ",BAT=" + String((analogRead(PIN_BATTERY) / 4095.0) * 3.3 * 4.4, 2) + "V" +
+      ",LIDAR=" + (lidar_enabled ? "ON" : "OFF") +
+      ",SPD=" + String(lidar_motor_speed, 2) + "rps" +
+      ",TARGET=" + String(lidar_target_speed, 2) + "rps" +
+      ",PWM=" + String(lidar_current_pwm, 1) + "\n";
     send(client_socket, resp.c_str(), resp.length(), 0);
   } else if (cmdLower == "reset") {
     DisplayHandler::addLogWarning("System reset via TCP");
@@ -375,36 +404,86 @@ void handleTcpCommand(const String &command) {
 }
 
 // ===== LIDAR =====
-void processLidarData() {
-  static uint8_t buffer[256];                // increased buffer to hold at least one full packet
-  static int idx = 0;                         // current fill index in buffer
-  static bool packetStarted = false;          // whether we are inside a packet
-  static int expectedLength = 0;               // expected total packet length (from header)
-  static uint32_t lastByteTime = 0;            // timestamp of last received byte (for timeout)
 
-  while (Serial2.available()) {
+float valuePID;
+void updateLidarPID() {
+  if (!lidar_enabled) {
+    // Motor should be stopped
+    ledcWrite(PIN_LidarM_pwm, 0);
+    lidar_integral = 0.0;
+    lidar_prev_error = 0.0;
+    lidar_motor_speed = 0.0;
+    lidar_current_pwm = 0.0;
+    return;
+  }
+
+  unsigned long now = millis();
+  if (lidar_last_pid_time == 0) {
+    lidar_last_pid_time = now;
+    return;
+  }
+
+  float dt = (now - lidar_last_pid_time) / 1000.0; // seconds
+  if (dt <= 0.0f) return;
+  lidar_last_pid_time = now;
+
+  float error = lidar_target_speed - lidar_motor_speed;
+
+  // Proportional
+  float P = lidar_Kp * error;
+
+  // Integral with anti-windup (clamp later)
+  lidar_integral += error * dt;
+
+  // Derivative on error
+  float derivative = (error - lidar_prev_error) / dt;
+  float D = lidar_Kd * derivative;
+
+  // Compute output
+  float output = P + lidar_Ki * lidar_integral + D;
+  valuePID = output;
+
+  // Clamp output to the allowed 8-bit range for lidar motor
+  if (output < LIDAR_PWM_MIN) output = LIDAR_PWM_MIN;
+  if (output > LIDAR_PWM_MAX) output = LIDAR_PWM_MAX;
+
+  // Store current PWM for status display
+  lidar_current_pwm = output;
+
+  // Write directly as 8-bit PWM
+  ledcWrite(PIN_LidarM_pwm, (uint32_t)round(output));
+
+  // Save for next iteration
+  lidar_prev_error = error;
+}
+
+void processLidarData() {
+  static uint8_t buffer[256];
+  static int idx = 0;
+  static bool packetStarted = false;
+  static int expectedLength = 0;
+  static uint32_t lastByteTime = 0;
+  int packetsProcessed = 0;
+  const int MAX_PACKETS_PER_CALL = 1;
+
+  while (Serial2.available() && (packetsProcessed < MAX_PACKETS_PER_CALL)) {
     uint8_t byte = Serial2.read();
     lastByteTime = millis();
 
-    // If not currently building a packet, look for the start byte 0xAA
     if (!packetStarted) {
       if (byte == 0xAA) {
         packetStarted = true;
         idx = 0;
         buffer[idx++] = byte;
-        expectedLength = 0;                     // length not yet known
+        expectedLength = 0;
       }
-      // ignore any other bytes outside a packet
       continue;
     }
 
-    // Guard against buffer overflow
     if (idx >= (int)sizeof(buffer)) {
-      // Buffer full without completing a packet ? reset and try to re-sync
       packetStarted = false;
       idx = 0;
       expectedLength = 0;
-      // If the current byte itself is a new start, handle it immediately
       if (byte == 0xAA) {
         packetStarted = true;
         buffer[idx++] = byte;
@@ -412,21 +491,14 @@ void processLidarData() {
       continue;
     }
 
-    // Store the byte
     buffer[idx++] = byte;
 
-    // Determine expected packet length if we haven't yet and have at least 3 bytes (header: AA + length L/H)
     if (expectedLength == 0 && idx >= 3) {
-      // Length is stored as big-endian in bytes 1 and 2 (after AA)
       expectedLength = (buffer[1] << 8) | buffer[2];
-
-      // Validate the claimed length (must be at least 3 and within buffer size)
       if (expectedLength < 3 || expectedLength > (int)sizeof(buffer)) {
-        // Invalid length ? discard everything and resync
         packetStarted = false;
         idx = 0;
         expectedLength = 0;
-        // If the current byte could be a new start, process it now
         if (byte == 0xAA) {
           packetStarted = true;
           buffer[idx++] = byte;
@@ -435,10 +507,16 @@ void processLidarData() {
       }
     }
 
-    // If we have collected the complete packet
     if (expectedLength > 0 && idx >= expectedLength) {
-      // Verify the first byte is still AA (should be, but check)
       if (buffer[0] == 0xAA) {
+        // --- Extract lidar motor speed if the packet contains valid data ---
+        // According to protocol: byte 5 must be 0xAD (data header) and packet must be at least 9 bytes long
+        if (expectedLength >= 9 && buffer[5] == 0xAD) {
+          uint8_t speed_byte = buffer[8];
+          lidar_motor_speed = speed_byte * 0.05f;
+          // Do NOT call updateLidarPID here; it will be called in loop with fixed interval
+        }
+
         if (udpHandler.sendRawData(buffer, expectedLength)) {
           lidar_packet_count++;
         } else {
@@ -446,34 +524,28 @@ void processLidarData() {
           DisplayHandler::addLogError("Lidar send error");
         }
       } else {
-        // This should not happen if sync is correct; log as error
         lidar_error_count++;
         DisplayHandler::addLogError("Lidar packet corrupted (first byte not AA)");
       }
 
-      // Reset for the next packet
       packetStarted = false;
       idx = 0;
       expectedLength = 0;
-      // Continue reading possible remaining bytes in the UART buffer
+      packetsProcessed++;
     }
   }
 
-  // Timeout: if we are in the middle of a packet and no new data arrives for 100 ms,
-  // assume the packet is incomplete and reset to avoid waiting forever.
   if (packetStarted && (millis() - lastByteTime > 100)) {
     packetStarted = false;
     idx = 0;
     expectedLength = 0;
-    // Optionally log a timeout event (can be too verbose, uncomment if needed)
-    // DisplayHandler::addLogWarning("Lidar packet timeout");
   }
 }
 
 void initLidar() {
   Serial2.begin(115200, SERIAL_8N1, 16, 17);
-  ledcAttach(PIN_LidarM_pwm, PWM_FREQ, PWM_RESOLUTION);
-  ledcWrite(PIN_LidarM_pwm, lidarCurrentDuty);
+  ledcAttach(PIN_LidarM_pwm, PWM_FREQ, LIDAR_PWM_RESOLUTION); // 8-bit
+  ledcWrite(PIN_LidarM_pwm, 0);  // start with motor off
   udpHandler.begin();
   Serial.println("[LIDAR] Ready");
   DisplayHandler::addLogSuccess("Lidar ready");
@@ -485,13 +557,17 @@ void handleSerialCommands() {
   String cmd = Serial.readStringUntil('\n'); cmd.trim();
 
   if (cmd == "-help") {
-    Serial.println("-help -status -restart -left <pwm> -right <pwm> -both <left> <right> -stop -lidar <pwm>");
+    Serial.println("-help -status -restart -left <pwm> -right <pwm> -both <left> <right> -stop");
+    Serial.println("-lidar_on -lidar_off -target <rps>");
+    Serial.println("-kp <value> -ki <value> -kd <value>");
   } else if (cmd == "-status") {
-    Serial.printf("WiFi: %s | L=%d R=%d | Bat=%.2fV\n",
+    Serial.printf("WiFi: %s | L=%d R=%d | Bat=%.2fV | Lidar: %s, speed=%.2f/%.2f rps, PWM=%.1f\n",
                   WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString().c_str() : "NC",
-                  leftMotor.getSpeed(), rightMotor.getSpeed(), (analogRead(PIN_BATTERY) / 4095.0) * 3.3 * 4.4);
-
-
+                  leftMotor.getSpeed(), rightMotor.getSpeed(),
+                  (analogRead(PIN_BATTERY) / 4095.0) * 3.3 * 4.4,
+                  lidar_enabled ? "ON" : "OFF",
+                  lidar_motor_speed, lidar_target_speed,
+                  lidar_current_pwm);
   } else if (cmd == "-restart") {
     DisplayHandler::addLogWarning("System reset via Serial");
     ESP.restart();
@@ -539,15 +615,39 @@ void handleSerialCommands() {
     leftMotorSpeed = 0; rightMotorSpeed = 0;
     leftMotor.setSpeed(0); rightMotor.setSpeed(0);
     DisplayHandler::addLogSerial("Stop");
-  } else if (cmd.startsWith("-lidar ")) {
-    int p = cmd.substring(7).toInt();
-    if (p >= 0 && p <= 255) {
-      lidarCurrentDuty = p;
-      ledcWrite(PIN_LidarM_pwm, p);
-      DisplayHandler::addLogSerial("Lidar: " + String(p));
+  } else if (cmd == "-lidar_on") {
+    lidar_enabled = true;
+    lidar_last_pid_time = millis();
+    lidar_integral = 0.0;
+    lidar_prev_error = 0.0;
+    ledcWrite(PIN_LidarM_pwm, LIDAR_START_PWM);
+    DisplayHandler::addLogSerial("Lidar ON, target " + String(lidar_target_speed, 1) + " rps, initial PWM set to " + String(LIDAR_START_PWM));
+  } else if (cmd == "-lidar_off") {
+    lidar_enabled = false;
+    ledcWrite(PIN_LidarM_pwm, 0);
+    lidar_motor_speed = 0.0;
+    lidar_current_pwm = 0.0;
+    DisplayHandler::addLogSerial("Lidar OFF");
+  } else if (cmd.startsWith("-target ")) {
+    float val = cmd.substring(8).toFloat();
+    if (val >= 0.0f && val <= 10.0f) {
+      lidar_target_speed = val;
+      DisplayHandler::addLogSerial("Target speed set to " + String(val) + " rps");
     } else {
-      DisplayHandler::addLogWarning("Invalid lidar PWM: " + String(p));
+      DisplayHandler::addLogWarning("Target speed out of range (0-10)");
     }
+  } else if (cmd.startsWith("-kp ")) {
+    float val = cmd.substring(4).toFloat();
+    lidar_Kp = val;
+    DisplayHandler::addLogSerial("Kp set to " + String(val));
+  } else if (cmd.startsWith("-ki ")) {
+    float val = cmd.substring(4).toFloat();
+    lidar_Ki = val;
+    DisplayHandler::addLogSerial("Ki set to " + String(val));
+  } else if (cmd.startsWith("-kd ")) {
+    float val = cmd.substring(4).toFloat();
+    lidar_Kd = val;
+    DisplayHandler::addLogSerial("Kd set to " + String(val));
   } else {
     // Unknown serial command notification
     Serial.println("[SERIAL] Unknown command: " + cmd);
@@ -573,7 +673,7 @@ void setup() {
     DisplayHandler::addLogError("WiFi failed");
   }
 
-  // Hall sensors have external 10k pull-ups, so use INPUT only
+  // Hall sensors have external 10k pull-ups, so use INPUT_PULLUP to be safe
   pinMode(PIN_HALL_LEFT, INPUT_PULLUP);
   pinMode(PIN_HALL_RIGHT, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(PIN_HALL_LEFT), hallLeftISR, FALLING);
@@ -591,13 +691,29 @@ void loop() {
   processLidarData();
   handleSerialCommands();
 
-  if (millis() - last_broadcast > 320) {
+  // Run PID at fixed interval
+  static unsigned long last_pid_run = 0;
+  if (millis() - last_pid_run >= LIDAR_PID_INTERVAL) {
+    updateLidarPID();
+    last_pid_run = millis();
+  }
+
+  if (millis() - last_telemetry > 320) {
     if (WiFi.status() == WL_CONNECTED) {
-      float batteryVoltage = (analogRead(PIN_BATTERY) / 4095.0) * 3.3 * 4.4; // Voltage divider correction
-      Serial.printf("[STATUS] L=%ld R=%ld Bat=%.2fV\n", getLeftCounter(), getRightCounter(), batteryVoltage);
       sendTelemetryUDP();
     }
-    last_broadcast = millis();
+    last_telemetry = millis();
   }
-  delay(10);
+  if (millis() - last_status > 5000) {
+    float batteryVoltage = (analogRead(PIN_BATTERY) / 4095.0) * 3.3 * 4.4; // Voltage divider correction
+    Serial.printf("[STATUS] L=%ld R=%ld Bat=%.2fV | Lidar: %s, speed=%.2f/%.2f rps, PWM=%.1f\n",
+                  getLeftCounter(), getRightCounter(), batteryVoltage,
+                  lidar_enabled ? "ON" : "OFF", lidar_motor_speed, lidar_target_speed, lidar_current_pwm);
+
+
+    Serial.print("valuePID = ") ;            
+    Serial.print(valuePID) ;            
+    Serial.println() ;            
+    last_status = millis();
+  }
 }

@@ -120,7 +120,10 @@ class LidarMotorController(Node):
 
         # Отправлять команду только если PWM изменился
         if pwm_value != self._last_pwm_sent:
-            self.send_tcp_command(f"set_lidar_pwm:{pwm_value}")
+            if pwm_value == 0:
+                self.send_tcp_command("lidar_off")
+            else:
+                self.send_tcp_command("lidar_on")
             self._last_pwm_sent = pwm_value
             self.last_command_time = current_time
         else:

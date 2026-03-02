@@ -785,7 +785,7 @@ class RobotGUI:
         self.send_command('disable_motors')
         self.speed_slider.set(0)
     
-    def set_lidar_pwm(self):
+def set_lidar_pwm(self):
         """Установить PWM LiDAR."""
         try:
             pwm = int(self.pwm_entry.get())
@@ -795,14 +795,14 @@ class RobotGUI:
                 messagebox.showerror("Ошибка", "PWM должен быть 0-255!")
         except:
             messagebox.showerror("Ошибка", "Неверное значение PWM!")
-    
+
     def enable_lidar(self):
         """Включить LiDAR."""
-        self.set_lidar_pwm()
-    
+        self.send_command('lidar_on')
+
     def disable_lidar(self):
         """Отключить LiDAR."""
-        self.send_command('set_lidar_pwm:0')
+        self.send_command('lidar_off')
     
     def request_status(self):
         """Запросить статус."""

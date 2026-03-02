@@ -595,18 +595,18 @@ class Esp32TcpClient(Node):
         except Exception:
             pass
     
-    def lidar_motor_cmd_callback(self, msg):
+def lidar_motor_cmd_callback(self, msg):
         """
         Обработка команды LiDAR мотора от lidar_motor_controller.
-        
+
         Args:
-            msg (String): команда типа 'set_lidar_pwm:<value>'
+            msg (String): команда типа 'lidar_on' или 'lidar_off'
         """
         command = msg.data
         if command:
             self.get_logger().debug(f'Получена команда LiDAR: {command}')
             self.send_command(command)
-    
+
     def reconnect_callback(self):
         """Попытка переподключения с экспоненциальным бэкоффом.
 

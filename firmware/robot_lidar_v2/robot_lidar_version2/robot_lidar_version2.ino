@@ -1,7 +1,7 @@
 // ===============================================
-// ESP32 MOBILE LIDAR ROBOT - MAIN FIRMWARE v2.9
+// ESP32 MOBILE LIDAR ROBOT - MAIN FIRMWARE v2.10
 // Direct PWM motor control (no PID)
-// 64-bit hall counters as two 32-bit halves (manual atomic access)
+// Lidar speed control with moving average and step correction
 // UDP telemetry, enhanced display logs
 // ===============================================
 
@@ -14,7 +14,6 @@
   #include <fcntl.h>
   #include <cstdint>
   #include <errno.h>
-//#include "include/lidar_data_new.h"
   #include "include/udp_handler_new.h"
   #include "include/display_handler.h"
 #endif
@@ -36,10 +35,12 @@
 #define PWM_FREQ        2000
 #define PWM_RESOLUTION  8           // 8-bit for drive motors
 #define LIDAR_PWM_RESOLUTION 8      // 8-bit for lidar motor (16-bit was not working)
-#define LIDAR_START_PWM 145         // Initial 8-bit PWM to start lidar rotation (within 135-155 range)
-#define LIDAR_PWM_MIN 135            // Minimum PWM when lidar is enabled
-#define LIDAR_PWM_MAX 155            // Maximum PWM when lidar is enabled
-#define LIDAR_PID_INTERVAL 1000       // PID update interval in ms
+#define LIDAR_START_PWM 127         // Initial PWM to start lidar rotation (must be within 125-160)
+#define LIDAR_PWM_MIN   120         // Minimum allowed PWM when lidar is enabled
+#define LIDAR_PWM_MAX   160         // Maximum allowed PWM when lidar is enabled
+
+// Moving average settings for lidar speed filtering
+#define SPEED_SMA_WINDOW 30         // Number of samples for moving average
 
 // ===== STRUCTURES =====
 struct Settings {
@@ -60,21 +61,23 @@ int udpPort = 4444;
 volatile int32_t hall_left_counter = 0;
 volatile int32_t hall_right_counter = 0;
 
-int lidarCurrentDuty = 0;               // not used directly anymore, kept for compatibility
 float current_battery_voltage = 0.0;
 unsigned long last_telemetry = 0;
 unsigned long last_status = 0;
+unsigned long last_updateLidarSpeed = 0;
 
-// Lidar PID control
+
+// Lidar simple control
 bool lidar_enabled = false;               // Lidar motor state
-float lidar_target_speed = 6.5;            // Desired speed in rps (user adjustable)
-float lidar_motor_speed = 0.0;             // Measured speed from packets (last known)
-// PID coefficients (tune as needed)
-float lidar_Kp = 150, lidar_Ki = 0.5, lidar_Kd = 0.1;
-float lidar_integral = 0.0;
-float lidar_prev_error = 0.0;
-unsigned long lidar_last_pid_time = 0;
-float lidar_current_pwm = 0.0;             // Current PWM output from PID (0-255)
+float lidar_target_speed = 5.0;            // Desired speed in rps (user adjustable)
+float lidar_motor_speed = 0.0;             // Raw measured speed from packets
+float lidar_current_pwm = 0.0;             // Current PWM output (0-255)
+
+// Moving average buffer
+float speed_buffer[SPEED_SMA_WINDOW];      // Circular buffer for speed samples
+int speed_buffer_index = 0;                 // Current index in buffer
+bool speed_buffer_filled = false;           // True after first full buffer
+float filtered_speed = 0.0;                 // Current filtered speed (moving average)
 
 int server_socket = -1;
 int client_socket = -1;
@@ -371,22 +374,33 @@ void handleTcpCommand(const String &command) {
     DisplayHandler::addLogSuccess("Motors disabled");
   } else if (cmdLower == "lidar_on") {
     lidar_enabled = true;
-    lidar_last_pid_time = millis();
-    lidar_integral = 0.0;
-    lidar_prev_error = 0.0;
-    ledcWrite(PIN_LidarM_pwm, LIDAR_START_PWM);  // initial 8-bit PWM to start rotation
+    lidar_current_pwm = LIDAR_START_PWM;
+    ledcWrite(PIN_LidarM_pwm, LIDAR_START_PWM);  // initial PWM to start rotation
+    // Reset moving average buffer
+    speed_buffer_index = 0;
+    speed_buffer_filled = false;
     DisplayHandler::addLogInfo("Lidar enabled, target " + String(lidar_target_speed, 1) + " rps, initial PWM set to " + String(LIDAR_START_PWM));
+    // После долгих тестов выяснилось, что двойной отправка lidar_on сбивает пакеты сканирования
+    // Поэтому при повторном включении (после переподключения) НЕ перезапускаем лидар
+    if (lidar_packet_count > 0) {
+      DisplayHandler::addLogWarning("Lidar already running, skipping restart to avoid stream drop");
+      return; // Не перезапускаем, если уже были пакеты
+    }
   } else if (cmdLower == "lidar_off") {
     lidar_enabled = false;
     ledcWrite(PIN_LidarM_pwm, 0);
     lidar_motor_speed = 0.0;
     lidar_current_pwm = 0.0;
+    filtered_speed = 0.0;
+    // Сброс счётчика пакетов при выключении, чтобы можно было снова включить
+    lidar_packet_count = 0;
     DisplayHandler::addLogInfo("Lidar disabled");
   } else if (cmdLower == "status") {
     String resp = String("STATUS:L=") + String(getLeftCounter()) + ",R=" + String(getRightCounter()) +
       ",BAT=" + String((analogRead(PIN_BATTERY) / 4095.0) * 3.3 * 4.4, 2) + "V" +
       ",LIDAR=" + (lidar_enabled ? "ON" : "OFF") +
       ",SPD=" + String(lidar_motor_speed, 2) + "rps" +
+      ",FILT=" + String(filtered_speed, 2) + "rps" +
       ",TARGET=" + String(lidar_target_speed, 2) + "rps" +
       ",PWM=" + String(lidar_current_pwm, 1) + "\n";
     send(client_socket, resp.c_str(), resp.length(), 0);
@@ -403,59 +417,46 @@ void handleTcpCommand(const String &command) {
   }
 }
 
-// ===== LIDAR =====
+// ===== LIDAR SIMPLE CONTROL =====
+void filter() {
+  if (!lidar_enabled) return;
 
-float valuePID;
-void updateLidarPID() {
-  if (!lidar_enabled) {
-    // Motor should be stopped
-    ledcWrite(PIN_LidarM_pwm, 0);
-    lidar_integral = 0.0;
-    lidar_prev_error = 0.0;
-    lidar_motor_speed = 0.0;
-    lidar_current_pwm = 0.0;
-    return;
+  // Add new raw speed to circular buffer
+  speed_buffer[speed_buffer_index] = lidar_motor_speed;
+  speed_buffer_index = (speed_buffer_index + 1) % SPEED_SMA_WINDOW;
+  if (!speed_buffer_filled && speed_buffer_index == 0) {
+    speed_buffer_filled = true;
   }
 
-  unsigned long now = millis();
-  if (lidar_last_pid_time == 0) {
-    lidar_last_pid_time = now;
-    return;
+  // Calculate moving average
+  float sum = 0.0;
+  int count = speed_buffer_filled ? SPEED_SMA_WINDOW : speed_buffer_index;
+  if (count == 0) return; // no data yet
+  for (int i = 0; i < count; i++) {
+    sum += speed_buffer[i];
   }
-
-  float dt = (now - lidar_last_pid_time) / 1000.0; // seconds
-  if (dt <= 0.0f) return;
-  lidar_last_pid_time = now;
-
-  float error = lidar_target_speed - lidar_motor_speed;
-
-  // Proportional
-  float P = lidar_Kp * error;
-
-  // Integral with anti-windup (clamp later)
-  lidar_integral += error * dt;
-
-  // Derivative on error
-  float derivative = (error - lidar_prev_error) / dt;
-  float D = lidar_Kd * derivative;
-
-  // Compute output
-  float output = P + lidar_Ki * lidar_integral + D;
-  valuePID = output;
-
-  // Clamp output to the allowed 8-bit range for lidar motor
-  if (output < LIDAR_PWM_MIN) output = LIDAR_PWM_MIN;
-  if (output > LIDAR_PWM_MAX) output = LIDAR_PWM_MAX;
-
-  // Store current PWM for status display
-  lidar_current_pwm = output;
-
-  // Write directly as 8-bit PWM
-  ledcWrite(PIN_LidarM_pwm, (uint32_t)round(output));
-
-  // Save for next iteration
-  lidar_prev_error = error;
+  filtered_speed = sum / count;
 }
+
+void updateLidarSpeed() {
+  if (!lidar_enabled) return;
+  if (!speed_buffer_filled) return;
+
+  float error = lidar_target_speed - filtered_speed;
+  const float threshold = 0.1;
+
+  if (error > threshold) {
+    lidar_current_pwm += 1;
+    if (lidar_current_pwm > LIDAR_PWM_MAX) lidar_current_pwm = LIDAR_PWM_MAX;
+  } else if (error < -threshold) {
+    lidar_current_pwm -= 1;
+    if (lidar_current_pwm < LIDAR_PWM_MIN) lidar_current_pwm = LIDAR_PWM_MIN;
+  }
+
+  ledcWrite(PIN_LidarM_pwm, (uint32_t)round(lidar_current_pwm));
+}
+
+
 
 void processLidarData() {
   static uint8_t buffer[256];
@@ -514,7 +515,8 @@ void processLidarData() {
         if (expectedLength >= 9 && buffer[5] == 0xAD) {
           uint8_t speed_byte = buffer[8];
           lidar_motor_speed = speed_byte * 0.05f;
-          // Do NOT call updateLidarPID here; it will be called in loop with fixed interval
+          // Call the simple control routine with the new speed
+          filter();
         }
 
         if (udpHandler.sendRawData(buffer, expectedLength)) {
@@ -559,15 +561,15 @@ void handleSerialCommands() {
   if (cmd == "-help") {
     Serial.println("-help -status -restart -left <pwm> -right <pwm> -both <left> <right> -stop");
     Serial.println("-lidar_on -lidar_off -target <rps>");
-    Serial.println("-kp <value> -ki <value> -kd <value>");
+    Serial.println("Note: PID commands (-kp, -ki, -kd) are ignored (simple step control used).");
   } else if (cmd == "-status") {
-    Serial.printf("WiFi: %s | L=%d R=%d | Bat=%.2fV | Lidar: %s, speed=%.2f/%.2f rps, PWM=%.1f\n",
+    Serial.printf("WiFi: %s | L=%d R=%d | Bat=%.2fV | Lidar: %s, speed=%.2f/%.2f rps (filt=%.2f), PWM=%.1f\n",
                   WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString().c_str() : "NC",
                   leftMotor.getSpeed(), rightMotor.getSpeed(),
                   (analogRead(PIN_BATTERY) / 4095.0) * 3.3 * 4.4,
                   lidar_enabled ? "ON" : "OFF",
                   lidar_motor_speed, lidar_target_speed,
-                  lidar_current_pwm);
+                  filtered_speed, lidar_current_pwm);
   } else if (cmd == "-restart") {
     DisplayHandler::addLogWarning("System reset via Serial");
     ESP.restart();
@@ -617,16 +619,18 @@ void handleSerialCommands() {
     DisplayHandler::addLogSerial("Stop");
   } else if (cmd == "-lidar_on") {
     lidar_enabled = true;
-    lidar_last_pid_time = millis();
-    lidar_integral = 0.0;
-    lidar_prev_error = 0.0;
+    lidar_current_pwm = LIDAR_START_PWM;
     ledcWrite(PIN_LidarM_pwm, LIDAR_START_PWM);
+    // Reset moving average buffer
+    speed_buffer_index = 0;
+    speed_buffer_filled = false;
     DisplayHandler::addLogSerial("Lidar ON, target " + String(lidar_target_speed, 1) + " rps, initial PWM set to " + String(LIDAR_START_PWM));
   } else if (cmd == "-lidar_off") {
     lidar_enabled = false;
     ledcWrite(PIN_LidarM_pwm, 0);
     lidar_motor_speed = 0.0;
     lidar_current_pwm = 0.0;
+    filtered_speed = 0.0;
     DisplayHandler::addLogSerial("Lidar OFF");
   } else if (cmd.startsWith("-target ")) {
     float val = cmd.substring(8).toFloat();
@@ -636,18 +640,9 @@ void handleSerialCommands() {
     } else {
       DisplayHandler::addLogWarning("Target speed out of range (0-10)");
     }
-  } else if (cmd.startsWith("-kp ")) {
-    float val = cmd.substring(4).toFloat();
-    lidar_Kp = val;
-    DisplayHandler::addLogSerial("Kp set to " + String(val));
-  } else if (cmd.startsWith("-ki ")) {
-    float val = cmd.substring(4).toFloat();
-    lidar_Ki = val;
-    DisplayHandler::addLogSerial("Ki set to " + String(val));
-  } else if (cmd.startsWith("-kd ")) {
-    float val = cmd.substring(4).toFloat();
-    lidar_Kd = val;
-    DisplayHandler::addLogSerial("Kd set to " + String(val));
+  } else if (cmd.startsWith("-kp ") || cmd.startsWith("-ki ") || cmd.startsWith("-kd ")) {
+    // Ignore PID commands � simple step control does not use them
+    DisplayHandler::addLogWarning("PID commands not used (simple step control active)");
   } else {
     // Unknown serial command notification
     Serial.println("[SERIAL] Unknown command: " + cmd);
@@ -658,9 +653,9 @@ void handleSerialCommands() {
 // ===== SETUP =====
 void setup() {
   Serial.begin(115200); delay(1000);
-  Serial.println("\n=== ESP32 Robot v2.9 (Direct PWM, 32+32 hall counters, enhanced display logs) ===\n");
+  Serial.println("\n=== ESP32 Robot v2.10 (Simple Lidar Step Control) ===\n");
   DisplayHandler::init();
-  DisplayHandler::displayStatus("v2.9");
+  DisplayHandler::displayStatus("v2.10");
   leftMotor.init(); rightMotor.init();
   loadSettings();
   WiFi.mode(WIFI_STA); WiFi.begin(ssid.c_str(), password.c_str());
@@ -691,29 +686,25 @@ void loop() {
   processLidarData();
   handleSerialCommands();
 
-  // Run PID at fixed interval
-  static unsigned long last_pid_run = 0;
-  if (millis() - last_pid_run >= LIDAR_PID_INTERVAL) {
-    updateLidarPID();
-    last_pid_run = millis();
-  }
-
+  // Send telemetry every 320 ms
   if (millis() - last_telemetry > 320) {
     if (WiFi.status() == WL_CONNECTED) {
       sendTelemetryUDP();
     }
     last_telemetry = millis();
   }
+
+  // Print status every 5 seconds
   if (millis() - last_status > 5000) {
     float batteryVoltage = (analogRead(PIN_BATTERY) / 4095.0) * 3.3 * 4.4; // Voltage divider correction
-    Serial.printf("[STATUS] L=%ld R=%ld Bat=%.2fV | Lidar: %s, speed=%.2f/%.2f rps, PWM=%.1f\n",
+    Serial.printf("[STATUS] L=%ld R=%ld Bat=%.2fV | Lidar: %s, speed=%.2f/%.2f rps (filt=%.2f), PWM=%.1f\n",
                   getLeftCounter(), getRightCounter(), batteryVoltage,
-                  lidar_enabled ? "ON" : "OFF", lidar_motor_speed, lidar_target_speed, lidar_current_pwm);
-
-
-    Serial.print("valuePID = ") ;            
-    Serial.print(valuePID) ;            
-    Serial.println() ;            
+                  lidar_enabled ? "ON" : "OFF", lidar_motor_speed, lidar_target_speed,
+                  filtered_speed, lidar_current_pwm);
     last_status = millis();
+  }
+  if (millis() - last_updateLidarSpeed > 2000) {
+    updateLidarSpeed();
+    last_updateLidarSpeed = millis();
   }
 }

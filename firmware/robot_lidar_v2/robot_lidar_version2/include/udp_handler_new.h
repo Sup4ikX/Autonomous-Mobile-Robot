@@ -1,16 +1,23 @@
 #ifndef UDP_HANDLER_NEW_H
 #define UDP_HANDLER_NEW_H
 
+#include <WiFiUdp.h>
+#include <IPAddress.h>
+
 #if defined(ARDUINO_ARCH_ESP32) || defined(ESP32)
-  #include <WiFiUdp.h>
+  #include <WiFi.h>
 #else
   class WiFiUDP {
   public:
     void begin(int port) {}
-    void beginPacket(const char* addr, int port) { return 0; }
+    bool beginPacket(const char* addr, int port) { return true; }
     size_t write(const uint8_t* buffer, size_t size) { return size; }
     int endPacket() { return 1; }
     void stop() {}
+    int parsePacket() { return 0; }
+    int read(uint8_t* buffer, size_t size) { return 0; }
+    IPAddress remoteIP() { return IPAddress(0,0,0,0); }
+    uint16_t remotePort() { return 0; }
   };
 #endif
 
@@ -25,7 +32,7 @@ private:
   bool is_initialized;
 
 public:
-  UdpHandlerNew(int port = 4444, const char* addr = "255.255.255.255") 
+  UdpHandlerNew(int port = 4444, const char* addr = "255.255.255.255")
     : broadcast_port(port), broadcast_addr(addr), is_initialized(false) {}
 
   void begin() {

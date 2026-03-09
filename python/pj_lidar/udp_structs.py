@@ -40,16 +40,17 @@ class TelemetryPacket(NamedTuple):
 
     @staticmethod
     def from_bytes(data: bytes) -> 'TelemetryPacket':
-        # >B 4B H Q Q (big-endian)
-        unpacked = struct.unpack('>B4BHQQ', data)
-        return TelemetryPacket(
-            unpacked[0],
-            tuple(unpacked[1:5]),
-            unpacked[5],
-            unpacked[6],
-            unpacked[7],
-        )
-
+        # Формат: 0xBB (1) + IP (4) + TCP port (2) + left (4) + right (4) = 15 байт
+        # IP и port – big-endian, счётчики – little-endian
+        if len(data) < 15:
+            raise ValueError("Packet too short")
+        ident = data[0]
+        ip = tuple(data[1:5])
+        tcp_port = (data[5] << 8) | data[6]
+        left = int.from_bytes(data[7:11], 'little')
+        right = int.from_bytes(data[11:15], 'little')
+        return TelemetryPacket(ident, ip, tcp_port, left, right)
+    
 def get_checksum(packet: bytes) -> int:
     # Last 2 bytes are checksum (big-endian)
     return (packet[-2] << 8) | packet[-1]

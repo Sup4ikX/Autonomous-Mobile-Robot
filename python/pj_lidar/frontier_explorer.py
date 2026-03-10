@@ -4,7 +4,8 @@ from rclpy.node import Node
 from nav_msgs.msg import OccupancyGrid, Odometry
 from geometry_msgs.msg import Twist, Point
 from visualization_msgs.msg import Marker, MarkerArray
-from std_msgs.msg import String  # NEW
+from sensor_msgs.msg import LaserScan
+from std_msgs.msg import String
 import math
 import numpy as np
 from scipy import ndimage
@@ -15,35 +16,41 @@ class FrontierExplorer(Node):
         super().__init__('frontier_explorer')
         self.map_sub = self.create_subscription(OccupancyGrid, '/map', self.map_callback, 10)
         self.odom_sub = self.create_subscription(Odometry, '/odom', self.odom_callback, 10)
+        self.scan_sub = self.create_subscription(LaserScan, '/scan', self.scan_callback, 10)
         self.cmd_pub = self.create_publisher(Twist, '/cmd_vel_auto', 10)
         self.marker_pub = self.create_publisher(Marker, '/frontier_marker', 10)
         self.frontier_markers_pub = self.create_publisher(MarkerArray, '/frontier_clusters', 10)
-        # NEW: подписка на команды
         self.cmd_sub = self.create_subscription(String, '/scan_command', self.cmd_callback, 10)
 
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
-        self.max_angular_speed = 0.3   # рад/с, ограничение угловой скорости
+
+        # Параметры движения
+        self.max_speed = 0.05
+        self.max_angular_speed = 0.3
+        self.kp_angle = 0.3
+        self.goal_tolerance = 0.3
+        self.angle_threshold = 0.3
+
+        # Параметры поиска границ
+        self.min_frontier_size = 5
+        self.search_range = 10.0
+        self.exploration_rate = 1.0
+
+        # Данные
         self.map = None
         self.map_info = None
         self.robot_pose_map = None
         self.robot_yaw = 0.0
         self.current_target = None
-        self.exploration_active = False  # NEW: изначально выключено
-
-        # Параметры
-        self.max_speed = 0.05
-        self.kp_angle = 0.3
-        self.goal_tolerance = 0.3
-        self.min_frontier_size = 5
-        self.search_range = 10.0
-        self.exploration_rate = 1.0
+        self.exploration_active = False
+        self.latest_scan = None
 
         self.timer = self.create_timer(1.0 / self.exploration_rate, self.update_exploration)
 
-    # NEW: обработчик команд
     def cmd_callback(self, msg):
         cmd = msg.data.strip().upper()
+        self.get_logger().info(f'Получена команда: {cmd}')
         if cmd == 'START_SCAN':
             if not self.exploration_active:
                 self.exploration_active = True
@@ -57,13 +64,16 @@ class FrontierExplorer(Node):
         else:
             self.get_logger().warn(f'Неизвестная команда: {cmd}')
 
-    # остальные методы без изменений
     def odom_callback(self, msg):
         pass
 
     def map_callback(self, msg):
         self.map = msg
         self.map_info = msg.info
+        self.get_logger().debug('Получена карта')
+
+    def scan_callback(self, msg):
+        self.latest_scan = msg
 
     def get_robot_pose_in_map(self):
         try:
@@ -74,13 +84,41 @@ class FrontierExplorer(Node):
             siny_cosp = 2 * (q.w * q.z + q.x * q.y)
             cosy_cosp = 1 - 2 * (q.y * q.y + q.z * q.z)
             yaw = math.atan2(siny_cosp, cosy_cosp)
+            self.get_logger().debug(f'Позиция в map: ({x:.2f}, {y:.2f}), yaw={yaw:.2f}')
             return (x, y), yaw
         except Exception as e:
             self.get_logger().warn(f"TF error: {e}")
             return None, None
 
+    def _normalize_angle(self, angle):
+        return math.atan2(math.sin(angle), math.cos(angle))
+
+    def _sector_min(self, center_robot_angle, half_width_rad):
+        if self.latest_scan is None:
+            return float('inf')
+        ranges = self.latest_scan.ranges
+        n = len(ranges)
+        if n == 0:
+            return float('inf')
+        angle_min = self.latest_scan.angle_min
+        angle_inc = self.latest_scan.angle_increment
+        center_scan = center_robot_angle
+        vals = []
+        for i, r in enumerate(ranges):
+            if not (math.isfinite(r) and r > 0.05):
+                continue
+            a_scan = angle_min + i * angle_inc
+            da = self._normalize_angle(a_scan - center_scan)
+            if abs(da) <= half_width_rad:
+                vals.append(r)
+        return min(vals) if vals else float('inf')
+
+    def _get_front_distance(self):
+        return self._sector_min(0.0, math.radians(12.0))
+
     def find_frontiers(self):
         if self.map is None:
+            self.get_logger().debug('Карта ещё не получена')
             return []
         data = np.array(self.map.data).reshape((self.map.info.height, self.map.info.width))
         unknown = (data == -1).astype(np.uint8)
@@ -89,6 +127,7 @@ class FrontierExplorer(Node):
         free_dilated = ndimage.binary_dilation(free, kernel).astype(np.uint8)
         frontier_cells = (unknown * free_dilated).astype(np.uint8)
         labeled, num_features = ndimage.label(frontier_cells)
+        self.get_logger().debug(f'Найдено {num_features} кластеров границ')
         clusters = []
         for i in range(1, num_features+1):
             cluster_indices = np.argwhere(labeled == i)
@@ -101,6 +140,7 @@ class FrontierExplorer(Node):
                 y = self.map.info.origin.position.y + r * self.map.info.resolution
                 world_coords.append((x, y))
             clusters.append(world_coords)
+        self.get_logger().debug(f'После фильтрации осталось {len(clusters)} кластеров')
         return clusters
 
     def select_target(self, clusters):
@@ -108,6 +148,7 @@ class FrontierExplorer(Node):
             return None
         robot_pose_map, _ = self.get_robot_pose_in_map()
         if robot_pose_map is None:
+            self.get_logger().warn('Не удалось получить позицию робота')
             return None
         best_cluster = None
         best_cost = float('inf')
@@ -120,6 +161,12 @@ class FrontierExplorer(Node):
             if cost < best_cost:
                 best_cost = cost
                 best_cluster = (center_x, center_y, cluster)
+        if best_cluster:
+            self.get_logger().info(
+                f'Выбрана цель: ({best_cluster[0]:.2f}, {best_cluster[1]:.2f}), '
+                f'расстояние {math.hypot(best_cluster[0]-robot_pose_map[0], best_cluster[1]-robot_pose_map[1]):.2f} м, '
+                f'размер кластера {len(best_cluster[2])}'
+            )
         return best_cluster
 
     def publish_markers(self, clusters, target):
@@ -173,34 +220,46 @@ class FrontierExplorer(Node):
         dx = target[0] - robot_pose_map[0]
         dy = target[1] - robot_pose_map[1]
         dist = math.hypot(dx, dy)
+
         if dist < self.goal_tolerance:
             self.get_logger().info('Цель достигнута')
             self.current_target = None
             self.cmd_pub.publish(Twist())
             return
+
         target_angle = math.atan2(dy, dx)
         angle_error = target_angle - robot_yaw
         angle_error = math.atan2(math.sin(angle_error), math.cos(angle_error))
+
         twist = Twist()
-        if abs(angle_error) > 0.1:
-            # ограничиваем угловую скорость
+        if abs(angle_error) > self.angle_threshold:
             desired_angular = self.kp_angle * angle_error
             twist.angular.z = max(min(desired_angular, self.max_angular_speed), -self.max_angular_speed)
             twist.linear.x = 0.0
+            self.get_logger().info(f'🔄 Поворот: angle_error={angle_error:.2f}, ang={twist.angular.z:.2f}')
         else:
             twist.linear.x = min(self.max_speed, dist)
             twist.angular.z = 0.0
+            self.get_logger().info(f'⬆️ Движение вперёд: speed={twist.linear.x:.2f}, distance={dist:.2f}')
+        self.cmd_pub.publish(twist)
+
     def update_exploration(self):
+        self.get_logger().debug('update_exploration вызван')
         if not self.exploration_active:
+            self.get_logger().debug('Исследование не активно')
             return
         clusters = self.find_frontiers()
         if not clusters:
             self.get_logger().info('Исследование завершено: границ не найдено')
             self.exploration_active = False
+            self.current_target = None
             self.cmd_pub.publish(Twist())
             return
         target_info = self.select_target(clusters)
         if target_info is None:
+            self.get_logger().warn('Цель не выбрана (select_target вернул None)')
+            self.current_target = None
+            self.cmd_pub.publish(Twist())
             return
         target_x, target_y, cluster = target_info
         self.current_target = (target_x, target_y)

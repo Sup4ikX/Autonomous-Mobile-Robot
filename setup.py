@@ -11,26 +11,21 @@ setup(
     version='1.0.0',
     packages=find_packages('python'),           # ищем пакеты в папке python
     package_dir={'': 'python'},                 # корень пакетов – папка python
-    data_files=[
-        # Ресурсы для ament_index
+        data_files=[
         ('share/ament_index/resource_index/packages',
          ['resource/' + package_name]),
 
-        # Файл package.xml
         ('share/' + package_name, ['package.xml']),
 
-        # Launch-файлы
         ('share/' + package_name + '/launch', ['launch/launch_all.py']),
 
-        # Конфигурационные файлы (yaml, rviz, xml)
+        # Конфигурационные файлы (только существующие)
         ('share/' + package_name + '/config', [
             'python/pj_lidar/config/slam_toolbox_config.yaml',
             'python/pj_lidar/config/rviz_config.rviz',
-            'python/pj_lidar/config/nav2_params.yaml',
-            'python/pj_lidar/config/navigate_w_replanning_and_recovery.xml'
         ]),
 
-        # Документация
+        # Документация (если нужна, оставляем)
         ('share/' + package_name + '/doc', [
             'docs/README.md',
             'docs/QUICKSTART.md',

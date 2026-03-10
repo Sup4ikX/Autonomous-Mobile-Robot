@@ -137,8 +137,8 @@ class LidarUdpServer(Node):
             self.process_scan_packet(data)
         elif packet_type == 0xAE:
             self.get_logger().debug('Получен пакет скорости LiDAR (0xAE)')
-        else:
-            self.get_logger().warn(f'Неизвестный тип пакета LiDAR: тип=0x{packet_type:02X}, индикатор=0x{indicator:02X}')
+        #else:
+        #   self.get_logger().warn(f'Неизвестный тип пакета LiDAR: тип=0x{packet_type:02X}, индикатор=0x{indicator:02X}')
 
     def process_scan_packet(self, data):
         try:
@@ -175,7 +175,7 @@ class LidarUdpServer(Node):
             if self._last_start_angle is not None:
                 delta = start_angle_deg - self._last_start_angle
                 if delta < -180.0 and self._packets_in_rev >= 4:
-                    self.get_logger().info(f'Новый оборот! delta={delta:.1f}°, packets_in_rev={self._packets_in_rev}')
+                    #elf.get_logger().info(f'Новый оборот! delta={delta:.1f}°, packets_in_rev={self._packets_in_rev}')
                     self._publish_full_scan()
                     self._accum_ranges = [float('inf')] * 360
                     self._accum_intensities = [0.0] * 360
@@ -190,7 +190,7 @@ class LidarUdpServer(Node):
             valid_points_in_packet = 0
             for i in range(num_points):
                 if offset + 2 >= pkt_len - 2:
-                    self.get_logger().warn(f'process_scan_packet: выход за границы данных на точке {i}, offset={offset}')
+                    #self.get_logger().warn(f'process_scan_packet: выход за границы данных на точке {i}, offset={offset}')
                     break
                 signal = data[offset]
                 dist_raw = int.from_bytes(data[offset+1:offset+3], 'big')

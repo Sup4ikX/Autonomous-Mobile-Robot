@@ -378,8 +378,8 @@ class Esp32TcpClient(Node):
         linear = msg.linear.x
         angular = msg.angular.z
 
-        left = int((-linear - angular) * 100)
-        right = int((-linear + angular) * 100)
+        left = int((linear - angular) * 100)
+        right = int((linear + angular) * 100)
 
         left = max(-100, min(100, left))
         right = max(-100, min(100, right))
